@@ -96,16 +96,6 @@ jobs:
           echo "owner_lc=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
           echo "dh_ns=$(echo '${{ secrets.DOCKERHUB_USERNAME }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
           
-      - name: Auth sanity check to Docker Hub
-        env:
-          DH_NS: ${{ steps.ns.outputs.dh_ns }}   # 已经强制小写
-        run: |
-          set -euo pipefail
-          docker pull hello-world
-          docker tag hello-world docker.io/${DH_NS}/auth-check:latest
-          docker push docker.io/${DH_NS}/auth-check:latest
-
-  
       - name: Build and push to GHCR + Docker Hub (amd64)
         shell: bash
         env:
