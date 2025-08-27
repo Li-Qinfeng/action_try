@@ -1,8 +1,8 @@
 name: vLLM Auto Rebase (amd64)
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"            # 每 30 分钟扫描一次，可改
+  # schedule:
+  #   - cron: "*/30 * * * *"            # 每 30 分钟扫描一次，可改
   workflow_dispatch:
     inputs:
       force_tag:
