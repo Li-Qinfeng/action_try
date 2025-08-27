@@ -2,7 +2,7 @@ name: vLLM Auto Rebase (amd64)
 
 on:
   # schedule:
-  #   - cron: "*/30 * * * *"            # 每 30 分钟扫描一次，可改
+  #   - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       force_tag:
@@ -12,8 +12,9 @@ on:
 
 env:
   SOURCE_IMAGE: vllm/vllm-openai
-  TARGET_IMAGE: ghcr.io/li-qinfeng/vllm-openai-secure
   PLATFORM: linux/amd64
+  TARGET_IMAGE_GHCR: ghcr.io/${{ github.repository_owner }}/vllm-openai-secure
+  TARGET_IMAGE_DH: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/vllm-openai-secure
 
 jobs:
   discover:
@@ -40,16 +41,16 @@ jobs:
           tags=$(curl -fsSL "https://registry.hub.docker.com/v2/repositories/${SOURCE_IMAGE}/tags?page_size=100" \
                   | jq -r '.results[].name')
 
-          # 3) 过滤你关心的模式（需要可自行调整）
+          # 3) 过滤你关心的模式
           tags=$(printf "%s\n" "$tags" | grep -E '^(v?[0-9]+\.[0-9]+(\.[0-9]+)?|.*cuda.*|.*rocm.*|latest)$' || true)
 
-          # 4) 跳过目标仓库已存在的 tag（避免重复发布）
+          # 4) 跳过 GHCR 或 Docker Hub 已存在的 tag（任一存在即跳过）
           pending=()
           while IFS= read -r t; do
-            if docker buildx imagetools inspect "${TARGET_IMAGE}:${t}" >/dev/null 2>&1; then
-              continue
-            fi
-            pending+=("$t")
+            skip=false
+            if docker buildx imagetools inspect "${{ env.TARGET_IMAGE_GHCR }}:${t}" >/dev/null 2>&1; then skip=true; fi
+            if docker buildx imagetools inspect "${{ env.TARGET_IMAGE_DH }}:${t}"   >/dev/null 2>&1; then skip=true; fi
+            if [[ "$skip" == "false" ]]; then pending+=("$t"); fi
           done < <(printf "%s\n" "$tags")
 
           printf 'tags=%s\n' "$(printf '%s\n' "${pending[@]}" | jq -R . | jq -cs .)" >> $GITHUB_OUTPUT
@@ -64,7 +65,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU (optional for consistency)
+      - name: Free disk space (recommended)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Set up QEMU (optional)
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
@@ -77,27 +83,45 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push all pending tags (amd64 only)
+      - name: Login Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Normalize owner (lowercase for GHCR)
+        id: repo
+        run: echo "owner_lc=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
+
+      - name: Build and push to GHCR + Docker Hub (amd64)
         shell: bash
         env:
           TAGS_JSON: ${{ needs.discover.outputs.tags }}
+          OWNER_LC: ${{ steps.repo.outputs.owner_lc }}
         run: |
           set -euo pipefail
           for tag in $(echo "$TAGS_JSON" | jq -r '.[]'); do
-            echo "==> Building ${tag} for ${PLATFORM}"
+            ghcr="ghcr.io/${OWNER_LC}/vllm-openai-secure:${tag}"
+            ghcr_r="ghcr.io/${OWNER_LC}/vllm-openai-secure:${tag}-r${{ github.run_number }}"
+            dh="${{ env.TARGET_IMAGE_DH }}:${tag}"
+            dh_r="${{ env.TARGET_IMAGE_DH }}:${tag}-r${{ github.run_number }}"
+
+            echo "==> Building ${tag} -> ${ghcr}  AND  ${dh}"
 
             docker buildx build \
               --platform "${PLATFORM}" \
               --file docker/Dockerfile \
               --build-arg BASE_IMAGE="${SOURCE_IMAGE}" \
               --build-arg BASE_TAG="${tag}" \
-              --tag "${TARGET_IMAGE}:${tag}" \
-              --tag "${TARGET_IMAGE}:${tag}-r${{ github.run_number }}" \
+              --tag "${ghcr}" \
+              --tag "${ghcr_r}" \
+              --tag "${dh}" \
+              --tag "${dh_r}" \
               --provenance=false \
-              --cache-from "type=registry,ref=${TARGET_IMAGE}:cache" \
-              --cache-to   "type=registry,ref=${TARGET_IMAGE}:cache,mode=max" \
               --push \
               .
 
-            echo "Pushed: ${TARGET_IMAGE}:${tag}"
+            echo "Pushed:"
+            echo "  ${ghcr}"
+            echo "  ${dh}"
           done
