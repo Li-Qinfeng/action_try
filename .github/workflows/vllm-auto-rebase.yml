@@ -61,67 +61,72 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write   # 推 GHCR 需要
+      packages: write
     steps:
       - uses: actions/checkout@v4
-
+  
       - name: Free disk space (recommended)
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc "$AGENT_TOOLSDIRECTORY" || true
           df -h
-
+  
       - name: Set up QEMU (optional)
         uses: docker/setup-qemu-action@v3
-
+  
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
-
+  
       - name: Login GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
+  
       - name: Login Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Normalize owner (lowercase for GHCR)
-        id: repo
-        run: echo "owner_lc=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
-
+  
+      - name: Compute namespaces (lowercase)
+        id: ns
+        shell: bash
+        run: |
+          echo "owner_lc=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_OUTPUT
+          echo "dh_ns=$(echo '${{ secrets.DOCKERHUB_USERNAME }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+  
       - name: Build and push to GHCR + Docker Hub (amd64)
         shell: bash
         env:
           TAGS_JSON: ${{ needs.discover.outputs.tags }}
-          OWNER_LC: ${{ steps.repo.outputs.owner_lc }}
+          OWNER_LC: ${{ steps.ns.outputs.owner_lc }}
+          DH_NS: ${{ steps.ns.outputs.dh_ns }}
         run: |
           set -euo pipefail
           for tag in $(echo "$TAGS_JSON" | jq -r '.[]'); do
             ghcr="ghcr.io/${OWNER_LC}/vllm-openai-secure:${tag}"
             ghcr_r="ghcr.io/${OWNER_LC}/vllm-openai-secure:${tag}-r${{ github.run_number }}"
-            dh="${{ env.TARGET_IMAGE_DH }}:${tag}"
-            dh_r="${{ env.TARGET_IMAGE_DH }}:${tag}-r${{ github.run_number }}"
-
-            echo "==> Building ${tag} -> ${ghcr}  AND  ${dh}"
-
+            dh="docker.io/${DH_NS}/vllm-openai-secure:${tag}"
+            dh_r="docker.io/${DH_NS}/vllm-openai-secure:${tag}-r${{ github.run_number }}"
+  
+            echo "==> Building ${tag} ->"
+            echo "    ${ghcr}"
+            echo "    ${dh}"
+  
             docker buildx build \
-              --platform "${PLATFORM}" \
+              --platform linux/amd64 \
               --file docker/Dockerfile \
               --build-arg BASE_IMAGE="${SOURCE_IMAGE}" \
               --build-arg BASE_TAG="${tag}" \
-              --tag "${ghcr}" \
-              --tag "${ghcr_r}" \
-              --tag "${dh}" \
-              --tag "${dh_r}" \
+              --tag "${ghcr}" --tag "${ghcr_r}" \
+              --tag "${dh}"   --tag "${dh_r}" \
               --provenance=false \
               --push \
               .
-
-            echo "Pushed:"
+  
+            echo "Pushed OK:"
             echo "  ${ghcr}"
             echo "  ${dh}"
           done
+
