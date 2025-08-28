@@ -62,7 +62,7 @@ impl RoGuard {
     /// 常量集合初始化（与 Python 版本保持一致）
     pub fn new() -> Self {
         let ro_allowed_rw = HashSet::from_iter([
-            "/dev/shm".to_string(),
+            "/dev".to_string(),
             "/tmp".to_string(),
             "/root/.triton".to_string(),
             "/root/.cache".to_string(),
