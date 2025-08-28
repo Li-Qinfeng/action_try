@@ -2,27 +2,31 @@
 ARG BASE_IMAGE=vllm/vllm-openai
 ARG BASE_TAG=latest
 
-# 源码目录（相对 build context 根 = 仓库根）
+# 源码目录（相对仓库根 = build context 根）
 ARG ROGUARD_SRC=docker/overlay/roguard-src
 
+# ---- [Stage 1] Rust 构建阶段 ----
 FROM rust:1-bullseye AS roguard-builder
 ARG ROGUARD_SRC
 WORKDIR /src/roguard
 
-# 先拷清单，利于缓存
+# 先拷清单（利于缓存）
 COPY ${ROGUARD_SRC}/Cargo.toml ./
-COPY ${ROGUARD_SRC}/Cargo.lock . 2>/dev/null || true
 RUN test -f Cargo.toml || (echo "ERROR: ${ROGUARD_SRC}/Cargo.toml not found" && false)
 
 # 再拷源码
 COPY ${ROGUARD_SRC}/src ./src
 RUN test -f src/main.rs || (echo "ERROR: ${ROGUARD_SRC}/src/main.rs not found" && false)
 
+# BuildKit 缓存加速
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/roguard/target \
     cargo build --release
+
+# 瘦身（无 strip 也不报错）
 RUN strip target/release/roguard || true
 
+# ---- [Stage 2] 最终运行镜像 ----
 FROM ${BASE_IMAGE}:${BASE_TAG}
 SHELL ["/bin/sh","-lc"]
 
@@ -30,7 +34,7 @@ SHELL ["/bin/sh","-lc"]
 COPY --from=roguard-builder /src/roguard/target/release/roguard /usr/local/bin/roguard
 RUN chmod +x /usr/local/bin/roguard
 
-# 2) 你的 patch 逻辑（保持不变）
+# 2) 插入 api_server 补丁（保持你的逻辑）
 COPY docker/overlay/patched/api_server_patch.py /tmp/api_server_patch.py
 RUN python3 - <<'PY'
 import importlib, pathlib, sys
@@ -60,10 +64,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
       gdb ltrace strace \
       git subversion mercurial \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove \
       python3-pip python3-venv software-properties-common apt \
  && apt-get clean && rm -rf /var/lib/apt/lists/* \
  && rm -f /usr/bin/pip /usr/bin/pip3 /usr/local/bin/pip /usr/local/bin/pip3 || true
+
 RUN rm -f /bin/bash || true
 RUN rm -rf /usr/share/man/* /usr/share/doc/* /var/cache/* /var/log/*
 
