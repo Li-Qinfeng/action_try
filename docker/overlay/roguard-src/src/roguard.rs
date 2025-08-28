@@ -63,6 +63,7 @@ impl RoGuard {
     pub fn new() -> Self {
         let ro_allowed_rw = HashSet::from_iter([
             "/dev".to_string(),
+            "/dev/shm".to_string(),
             "/tmp".to_string(),
             "/root/.triton".to_string(),
             "/root/.cache".to_string(),
