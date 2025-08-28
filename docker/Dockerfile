@@ -1,12 +1,30 @@
+# syntax=docker/dockerfile:1.7
+
 # ===== 上游镜像参数（由 Actions 传入；本地不传则用 latest）=====
 ARG BASE_IMAGE=vllm/vllm-openai
 ARG BASE_TAG=latest
-FROM ${BASE_IMAGE}:${BASE_TAG}
 
+# ---- [Stage 1] Rust 构建阶段：在独立环境里编译 roguard ----
+FROM rust:1-bullseye AS roguard-builder
+WORKDIR /src/roguard
+
+# 把 Rust 源码复制进来（你已经把源码放在 action_try/docker/overlay/roguard-src/）
+COPY action_try/docker/overlay/roguard-src/ ./
+
+# 使用 BuildKit 的缓存加速（可选）
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/roguard/target \
+    cargo build --release
+
+# 尽量瘦身（不存在 strip 也不会失败）
+RUN strip target/release/roguard || true
+
+# ---- [Stage 2] 最终运行镜像：来自上游 vLLM ----
+FROM ${BASE_IMAGE}:${BASE_TAG}
 SHELL ["/bin/sh","-lc"]
 
-# 1) 植入 Rust 二进制
-COPY docker/overlay/bin/roguard /usr/local/bin/roguard
+# 1) 植入 Rust 二进制（来自上面的构建阶段）
+COPY --from=roguard-builder /src/roguard/target/release/roguard /usr/local/bin/roguard
 RUN chmod +x /usr/local/bin/roguard
 
 # 2) 覆盖入口 Python 脚本（动态定位 vllm 安装路径）
