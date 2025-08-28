@@ -65,10 +65,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
   
-      - name: Free disk space (recommended)
+      - name: Free disk space (aggressive)
+        shell: bash
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc "$AGENT_TOOLSDIRECTORY" || true
-          df -h
+          set -euxo pipefail
+          echo "== Before cleanup =="; df -h || true
+
+          # 常见大头
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          sudo rm -rf /opt/hostedtoolcache || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/lib/node_modules || true
+          sudo rm -rf $HOME/.cache || true
+
+          # CodeQL / Actions 诊断缓存等
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /home/runner/work/_temp/_github_home || true
+          sudo rm -rf /home/runner/work/_temp/_github_workflow || true
+
+          # Docker 清理（先确保 daemon 起着）
+          docker system prune -af --volumes || true
+
+          echo "== After cleanup =="; df -h || true
   
       - name: Set up QEMU (optional)
         uses: docker/setup-qemu-action@v3
