@@ -1,41 +1,28 @@
 # syntax=docker/dockerfile:1.7
-
-# ===== 上游镜像参数（由 Actions 传入；本地不传则用 latest）=====
 ARG BASE_IMAGE=vllm/vllm-openai
 ARG BASE_TAG=latest
 
-# 让源码路径可配置，默认按你现在的布局
-ARG ROGUARD_SRC=action_try/docker/overlay/roguard-src
+# 源码目录（相对 build context 根 = 仓库根）
+ARG ROGUARD_SRC=docker/overlay/roguard-src
 
-# ---- [Stage 1] Rust 构建阶段：在独立环境里编译 roguard ----
 FROM rust:1-bullseye AS roguard-builder
-# 传入外层 ARG
 ARG ROGUARD_SRC
 WORKDIR /src/roguard
 
-# 先把 Cargo 清单类文件单独 COPY（利于缓存命中；不存在也不会报错）
-# 注意：这些 COPY 如果源不存在不会失败，所以后面有显式检查
+# 先拷清单，利于缓存
 COPY ${ROGUARD_SRC}/Cargo.toml ./
-COPY ${ROGUARD_SRC}/Cargo.lock ./
+COPY ${ROGUARD_SRC}/Cargo.lock . 2>/dev/null || true
+RUN test -f Cargo.toml || (echo "ERROR: ${ROGUARD_SRC}/Cargo.toml not found" && false)
 
-# 显式检查：至少要有 Cargo.toml
-RUN test -f Cargo.toml || (echo "ERROR: ${ROGUARD_SRC}/Cargo.toml not found in build context" && false)
-
-# 再复制源码
+# 再拷源码
 COPY ${ROGUARD_SRC}/src ./src
+RUN test -f src/main.rs || (echo "ERROR: ${ROGUARD_SRC}/src/main.rs not found" && false)
 
-# 再次显式检查 main.rs 是否存在（能在日志里直观看到）
-RUN test -f src/main.rs || (echo "ERROR: ${ROGUARD_SRC}/src/main.rs not found in build context" && false)
-
-# 使用 BuildKit 的缓存加速
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/roguard/target \
     cargo build --release
-
-# 尽量瘦身
 RUN strip target/release/roguard || true
 
-# ---- [Stage 2] 最终运行镜像：来自上游 vLLM ----
 FROM ${BASE_IMAGE}:${BASE_TAG}
 SHELL ["/bin/sh","-lc"]
 
@@ -43,39 +30,25 @@ SHELL ["/bin/sh","-lc"]
 COPY --from=roguard-builder /src/roguard/target/release/roguard /usr/local/bin/roguard
 RUN chmod +x /usr/local/bin/roguard
 
-# 2) 覆盖入口 Python 脚本（动态定位 vllm 安装路径）
+# 2) 你的 patch 逻辑（保持不变）
 COPY docker/overlay/patched/api_server_patch.py /tmp/api_server_patch.py
 RUN python3 - <<'PY'
 import importlib, pathlib, sys
-def die(msg: str, code: int = 1):
-    print(msg, file=sys.stderr); sys.exit(code)
-try:
-    m = importlib.import_module("vllm")
-except Exception as e:
-    die(f"ERROR: cannot import vllm: {e}")
-pkg_root = pathlib.Path(m.__file__).parent
-dst_dir  = pkg_root / "entrypoints" / "openai"
-dst      = dst_dir / "api_server.py"
-patch    = pathlib.Path("/tmp/api_server_patch.py")
-print("Detected vllm package root:", pkg_root)
-print("Target dir:", dst_dir)
+def die(msg,code=1): print(msg,file=sys.stderr); sys.exit(code)
+try: m=importlib.import_module("vllm")
+except Exception as e: die(f"ERROR: cannot import vllm: {e}")
+pkg_root=pathlib.Path(m.__file__).parent
+dst_dir=pkg_root/"entrypoints"/"openai"; dst=dst_dir/"api_server.py"
+patch=pathlib.Path("/tmp/api_server_patch.py")
 if not dst_dir.exists(): die(f"ERROR: target dir not found: {dst_dir}")
-if not dst.exists():     die(f"ERROR: target file not found: {dst}")
-patch_text = patch.read_text(encoding="utf-8")
-orig_text  = dst.read_text(encoding="utf-8")
-if patch_text.strip() in orig_text:
-    print("Patch already present. Skip modifying", dst); sys.exit(0)
-lines = orig_text.splitlines(keepends=True)
-insert_idx = 0
-while insert_idx < len(lines):
-    s = lines[insert_idx].lstrip()
-    if s.startswith("# SPDX-"):
-        insert_idx += 1; continue
-    break
-new_text = "".join(lines[:insert_idx]) + patch_text + ("\n" if not patch_text.endswith("\n") else "") + "".join(lines[insert_idx:])
-bak = dst.with_suffix(".py.bak")
-dst.write_text(new_text, encoding="utf-8")
-bak.write_text(orig_text, encoding="utf-8")
+if not dst.exists(): die(f"ERROR: target file not found: {dst}")
+patch_text=patch.read_text(encoding="utf-8"); orig_text=dst.read_text(encoding="utf-8")
+if patch_text.strip() in orig_text: print("Patch already present. Skip",dst); sys.exit(0)
+lines=orig_text.splitlines(keepends=True); i=0
+while i<len(lines) and lines[i].lstrip().startswith("# SPDX-"): i+=1
+new="".join(lines[:i])+patch_text+("\n" if not patch_text.endswith("\n") else "")+"".join(lines[i:])
+dst.with_suffix(".py.bak").write_text(orig_text,encoding="utf-8")
+dst.write_text(new,encoding="utf-8")
 print("Patched (prepended):", dst)
 PY
 
@@ -87,16 +60,13 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
       gdb ltrace strace \
       git subversion mercurial \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
-
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove \
       python3-pip python3-venv software-properties-common apt \
  && apt-get clean && rm -rf /var/lib/apt/lists/* \
  && rm -f /usr/bin/pip /usr/bin/pip3 /usr/local/bin/pip /usr/local/bin/pip3 || true
-
 RUN rm -f /bin/bash || true
 RUN rm -rf /usr/share/man/* /usr/share/doc/* /var/cache/* /var/log/*
 
-# 4) 元数据（FROM 后重新声明 ARG）
 ARG BASE_IMAGE
 ARG BASE_TAG
 LABEL io.vllm.upstream.ref="${BASE_IMAGE}:${BASE_TAG}"
