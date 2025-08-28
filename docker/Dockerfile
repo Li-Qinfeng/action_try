@@ -5,7 +5,7 @@ ARG BASE_TAG=latest
 # 源码目录（相对仓库根 = build context 根）
 ARG ROGUARD_SRC=docker/overlay/roguard-src
 
-# ---- [Stage 1] Rust 构建阶段 ----
+########## [Stage 0] Build roguard via cargo install ##########
 FROM rust:1-bullseye AS roguard-builder
 ARG ROGUARD_SRC
 WORKDIR /src/roguard
@@ -18,20 +18,32 @@ RUN test -f Cargo.toml || (echo "ERROR: ${ROGUARD_SRC}/Cargo.toml not found" && 
 COPY ${ROGUARD_SRC}/src ./src
 RUN test -f src/main.rs || (echo "ERROR: ${ROGUARD_SRC}/src/main.rs not found" && false)
 
-# BuildKit 缓存加速
+# 构建并“安装”到 /out（不依赖包名）
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/roguard/target \
-    cargo build --release
+    cargo install --path . --locked --root /out
 
-# 瘦身（无 strip 也不报错）
-RUN strip target/release/roguard || true
+# 显式校验 /out/bin 里只有一个可执行文件，并重命名为 roguard，便于后续 COPY
+RUN set -eux; \
+    ls -la /out/bin; \
+    cnt=$(find /out/bin -maxdepth 1 -type f -executable | wc -l); \
+    test "$cnt" -ge 1 || (echo "ERROR: no executable produced under /out/bin" && false); \
+    if [ "$cnt" -gt 1 ]; then \
+      echo "ERROR: multiple executables found under /out/bin; please keep only one or adjust Dockerfile logic."; \
+      find /out/bin -maxdepth 1 -type f -executable -printf ' - %f\n'; \
+      exit 1; \
+    fi; \
+    exe=$(find /out/bin -maxdepth 1 -type f -executable | head -n1); \
+    strip "$exe" || true; \
+    mv "$exe" /out/bin/roguard; \
+    ls -la /out/bin
 
-# ---- [Stage 2] 最终运行镜像 ----
+########## [Stage 1] Final runtime image ##########
 FROM ${BASE_IMAGE}:${BASE_TAG}
 SHELL ["/bin/sh","-lc"]
 
-# 1) 植入 Rust 二进制
-COPY --from=roguard-builder /src/roguard/target/release/roguard /usr/local/bin/roguard
+# 1) 植入 Rust 二进制（固定名 roguard）
+COPY --from=roguard-builder /out/bin/roguard /usr/local/bin/roguard
 RUN chmod +x /usr/local/bin/roguard
 
 # 2) 插入 api_server 补丁（保持你的逻辑）
@@ -64,12 +76,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
       gdb ltrace strace \
       git subversion mercurial \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
-
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove \
       python3-pip python3-venv software-properties-common apt \
  && apt-get clean && rm -rf /var/lib/apt/lists/* \
  && rm -f /usr/bin/pip /usr/bin/pip3 /usr/local/bin/pip /usr/local/bin/pip3 || true
-
 RUN rm -f /bin/bash || true
 RUN rm -rf /usr/share/man/* /usr/share/doc/* /var/cache/* /var/log/*
 
