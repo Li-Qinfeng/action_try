@@ -23,19 +23,23 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/roguard/target \
     cargo install --path . --locked --root /out
 
-# 显式校验 /out/bin 里只有一个可执行文件，并重命名为 roguard，便于后续 COPY
+# 若已经产出了 /out/bin/roguard 就直接 strip；否则仅在唯一可执行时复制为 roguard
 RUN set -eux; \
-    ls -la /out/bin; \
-    cnt=$(find /out/bin -maxdepth 1 -type f -executable | wc -l); \
-    test "$cnt" -ge 1 || (echo "ERROR: no executable produced under /out/bin" && false); \
-    if [ "$cnt" -gt 1 ]; then \
-      echo "ERROR: multiple executables found under /out/bin; please keep only one or adjust Dockerfile logic."; \
-      find /out/bin -maxdepth 1 -type f -executable -printf ' - %f\n'; \
-      exit 1; \
+    ls -la /out/bin || true; \
+    if [ -x /out/bin/roguard ]; then \
+      strip /out/bin/roguard || true; \
+    else \
+      cnt=$(find /out/bin -maxdepth 1 -type f -executable | wc -l); \
+      test "$cnt" -ge 1 || (echo "ERROR: no executable produced under /out/bin" && false); \
+      if [ "$cnt" -gt 1 ]; then \
+        echo "ERROR: multiple executables found under /out/bin; please keep only one or adjust Dockerfile logic."; \
+        find /out/bin -maxdepth 1 -type f -executable -printf ' - %f\n'; \
+        exit 1; \
+      fi; \
+      exe=$(find /out/bin -maxdepth 1 -type f -executable | head -n1); \
+      strip "$exe" || true; \
+      cp "$exe" /out/bin/roguard; \
     fi; \
-    exe=$(find /out/bin -maxdepth 1 -type f -executable | head -n1); \
-    strip "$exe" || true; \
-    mv "$exe" /out/bin/roguard; \
     ls -la /out/bin
 
 ########## [Stage 1] Final runtime image ##########
@@ -76,10 +80,12 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive \
       gdb ltrace strace \
       git subversion mercurial \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove \
       python3-pip python3-venv software-properties-common apt \
  && apt-get clean && rm -rf /var/lib/apt/lists/* \
  && rm -f /usr/bin/pip /usr/bin/pip3 /usr/local/bin/pip /usr/local/bin/pip3 || true
+
 RUN rm -f /bin/bash || true
 RUN rm -rf /usr/share/man/* /usr/share/doc/* /var/cache/* /var/log/*
 
