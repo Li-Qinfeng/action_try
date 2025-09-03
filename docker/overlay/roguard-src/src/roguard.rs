@@ -1,27 +1,87 @@
+//! # RoGuard: Read-Only Guard
+//!
+//! This module enforces **read-only guarantees** inside a container runtime.
+//! It checks mount points, capabilities, and write probes to ensure the root filesystem
+//! and critical paths cannot be modified.
+//!
+//! ## Features
+//! - Validate that certain mount points (`/`, `/model`) are mounted read-only.
+//! - Ensure writable mounts (`/tmp`, `/dev/shm`, `/root/.cache`, etc.) are tmpfs/ramfs.
+//! - Probe root (`/`) write attempts and expect `EROFS` (read-only filesystem).
+//! - Verify dangerous Linux capabilities (e.g. `CAP_SYS_ADMIN`, `CAP_MKNOD`) are dropped.
+//! - Ensure `mount -o remount,rw /` is blocked.
+//!
+//! ## Example: One-shot Verification
+//!
+//! ```no_run
+//! use roguard::RoGuard;
+//! use std::process;
+//!
+//! fn main() {
+//!     let guard = RoGuard::new();
+//!     let (ok, report) = guard.verify_once();
+//!     println!("{}", serde_json::to_string_pretty(&report).unwrap());
+//!     if !ok {
+//!         eprintln!("[RO-GUARD] startup check failed");
+//!         process::exit(1);
+//!     }
+//! }
+//! ```
+//!
+//! ## Example: Watch Mode
+//!
+//! ```no_run
+//! use roguard::RoGuard;
+//! use std::time::Duration;
+//!
+//! fn main() {
+//!     // Check every 5 seconds; exit after 1 consecutive violation
+//!     RoGuard::new().watch(Duration::from_secs(5), 1);
+//! }
+//! ```
+//!
+//! Expected behavior:
+//! - In one-shot mode, prints a JSON report and returns 0 on success, nonzero on violation.
+//! - In watch mode, prints a JSON line every cycle, and exits with code 1 if violations persist.
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::process::Command;
 
-use std::time::Duration;   // 文件顶部已有 imports 的话，补这一行
+use std::time::Duration;   // Add this line if not already imported at the top
 use std::thread;
-
 
 const PROBE_PATH: &str = "/.__ro_probe__";
 const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
 const CAP_MKNOD_BIT: u64 = 1 << 27;
 
-/// 单条挂载信息
+/// Represents a single mount entry parsed from `/proc/self/mountinfo`.
+///
+/// Fields:
+/// - `mp`: mount point path (e.g., `/`, `/dev/shm`)
+/// - `opts`: mount options as a set (e.g., `ro`, `rw`, `nosuid`)
+/// - `fstype`: filesystem type (e.g., `ext4`, `tmpfs`)
+/// - `src`: source (device/path)
 #[derive(Debug, Clone)]
 struct MountEntry {
-    mp: String,                    // 挂载点
-    opts: HashSet<String>,         // mount options（逗号分隔）
-    fstype: String,                // 文件系统类型
-    src: String,                   // 源（设备/路径）
+    mp: String,                    // mount point
+    opts: HashSet<String>,         // mount options (comma separated)
+    fstype: String,                // filesystem type
+    src: String,                   // source (device/path)
 }
 
-/// 输出报告（字段名与 Python 版本保持一致）
+/// Report produced by a verification run. Field names are aligned with the Python version.
+///
+/// - `ro_violations`: mount points that were required to be read-only but were not
+/// - `unexpected_rw_mounts`: writable mount points not in the whitelist
+/// - `allowed_but_not_memfs`: whitelisted writable mount points that are not tmpfs/ramfs
+/// - `root_write_probe`: result of the root write probe (should be `EROFS`)
+/// - `cap_violations`: dangerous capabilities detected (e.g. `CAP_SYS_ADMIN`)
+/// - `remount_root_blocked`: whether a `mount -o remount,rw /` attempt was blocked
+/// - `remount_msg`: stderr/stdout message from the remount attempt
+/// - `allowed_rw_whitelist`: sorted whitelist of allowed writable mount points
+/// - `required_ro`: sorted list of mount points that must be read-only
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub ro_violations: Vec<String>,
@@ -35,22 +95,45 @@ pub struct Report {
     pub required_ro: Vec<String>,
 }
 
+/// Result of a root write probe.
 #[derive(Debug, Serialize)]
 pub struct RootWriteProbe {
+    /// `true` means the probe met the expected condition (root is effectively read-only).
     pub ok: bool,
-    pub need: &'static str, // 固定 "EROFS"
+    /// Expected error code string when attempting a write on `/`: fixed `"EROFS"`.
+    pub need: &'static str, // fixed "EROFS"
 }
 
-/// 面向对象封装
-/// RO 策略配置：限定哪些挂载点必须只读、哪些目录允许写且必须是内存盘等
+/// Read-only guard policy and verification logic.
+///
+/// The policy defines:
+/// - which mount points are required to be read-only,
+/// - which mount points may be writable but must be in-memory filesystems (`tmpfs`/`ramfs`),
+/// - and which filesystem types/prefixes are ignored during scanning.
+///
+/// # Examples
+///
+/// ## One-shot verification
+/// ```no_run
+/// use std::process;
+/// let g = roguard::RoGuard::new();
+/// let (ok, report) = g.verify_once();
+/// println!("{}", serde_json::to_string(&report).unwrap());
+/// if !ok { process::exit(1); }
+/// ```
+///
+/// ## Watch mode (will exit the process with code 1 after `grace` consecutive failures)
+/// ```no_run
+/// use std::time::Duration;
+/// roguard::RoGuard::new().watch(Duration::from_secs(5), 1);
+/// ```
 pub struct RoGuard {
-    ro_allowed_rw: HashSet<String>,    // 只读模式下“允许写”的挂载点白名单（如 /tmp、/dev/shm、/root/.cache、/root/.triton）
-    ro_required_ro: HashSet<String>,   // 必须为只读(ro)的挂载点集合（如 / 和 /model）
-    ro_mem_fs: HashSet<String>,        // 白名单挂载点要求的文件系统类型（仅允许内存盘：tmpfs/ramfs）
-    ro_ign_fstypes: HashSet<String>,   // 扫描时忽略的虚拟/系统文件系统类型（proc、sysfs、cgroup 等）
-    ro_ign_prefixes: Vec<String>,      // 扫描时忽略的路径前缀（/proc、/sys、/dev 等）
+    ro_allowed_rw: HashSet<String>,    // whitelist of writable mount points (e.g. /tmp, /dev/shm, /root/.cache, /root/.triton)
+    ro_required_ro: HashSet<String>,   // mount points that must be read-only (e.g. / and /model)
+    ro_mem_fs: HashSet<String>,        // allowed writable mount points must be tmpfs/ramfs
+    ro_ign_fstypes: HashSet<String>,   // ignore these virtual/system filesystem types (proc, sysfs, cgroup, etc.)
+    ro_ign_prefixes: Vec<String>,      // ignore mount points with these prefixes (/proc, /sys, /dev, etc.)
 }
-
 
 impl Default for RoGuard {
     fn default() -> Self {
@@ -59,7 +142,13 @@ impl Default for RoGuard {
 }
 
 impl RoGuard {
-    /// 常量集合初始化（与 Python 版本保持一致）
+    /// Construct a `RoGuard` with built-in policy sets (kept consistent with the Python version).
+    ///
+    /// - `ro_allowed_rw`: `/dev`, `/dev/shm`, `/tmp`, `/root/.triton`, `/root/.cache`
+    /// - `ro_required_ro`: `/`, `/model`
+    /// - `ro_mem_fs`: `tmpfs`, `ramfs`
+    /// - `ro_ign_fstypes`: typical virtual/system fs types (e.g., `proc`, `sysfs`, `cgroup*`, etc.)
+    /// - `ro_ign_prefixes`: `/proc`, `/sys`
     pub fn new() -> Self {
         let ro_allowed_rw = HashSet::from_iter([
             "/dev".to_string(),
@@ -100,21 +189,27 @@ impl RoGuard {
         }
     }
 
-    /// ===== A) 解析 /proc/self/mountinfo =====
+    /// Parse `/proc/self/mountinfo` into a vector of `MountEntry`.
+    ///
+    /// Each line is split into the "left" and "right" parts by `" - "`. The 5th and 6th fields in
+    /// the left part are interpreted as `mount point` and `options`, and the first two fields of the
+    /// right part are interpreted as `fstype` and `src`.
+    ///
+    /// Returns `io::Result<Vec<MountEntry>>`.
     fn parse_mountinfo(&self) -> io::Result<Vec<MountEntry>> {
         let mut s = String::new();
         fs::File::open("/proc/self/mountinfo")?.read_to_string(&mut s)?;
         let mut out = Vec::new();
 
         for line in s.lines() {
-            // 形如：<left> - <fstype> <src> <superopts>
+            // Format: <left> - <fstype> <src> <superopts>
             let mut parts = line.splitn(2, " - ");
             let left = parts.next().unwrap_or("");
             let right = parts.next().unwrap_or("");
             let l: Vec<&str> = left.split_whitespace().collect();
             let r: Vec<&str> = right.split_whitespace().collect();
 
-            // 第 5 列挂载点，第 6 列 options
+            // 5th column: mount point, 6th column: options
             let mp = l.get(4).copied().unwrap_or("").to_string();
             let opts_str = l.get(5).copied().unwrap_or("");
             let opts: HashSet<String> =
@@ -129,7 +224,12 @@ impl RoGuard {
         Ok(out)
     }
 
-    /// 是否忽略此挂载（与 Python 逻辑等价）
+    /// Decide whether a mount entry should be ignored during scanning.
+    ///
+    /// Rules:
+    /// - never ignore `/`,
+    /// - ignore if filesystem type is in `ro_ign_fstypes`,
+    /// - ignore if mount point starts with any prefix in `ro_ign_prefixes`.
     fn should_ignore(&self, me: &MountEntry) -> bool {
         if me.mp == "/" {
             return false;
@@ -145,14 +245,21 @@ impl RoGuard {
         false
     }
 
-    /// 根据目标路径查找挂载
+    /// Find a mount entry by an exact mount point path.
+    ///
+    /// Returns `Some(&MountEntry)` if found, otherwise `None`.
     fn get_mount<'a>(&self, mounts: &'a [MountEntry], target: &str) -> Option<&'a MountEntry> {
         mounts.iter().find(|m| m.mp == target)
     }
 
-    /// ===== C) 写探针：期望在只读根上得到 EROFS =====
+    /// Write probe: attempt writing `PROBE_PATH` under `/`.
+    ///
+    /// Returns `(ok, msg)`:
+    /// - `ok = true`  means write succeeded (root is *writable*; not expected),
+    /// - `ok = false` with `msg == "EROFS"` means read-only as expected,
+    /// - `ok = false` with other `msg` contains the error reason.
     fn write_probe(&self, path: &str) -> (bool, String) {
-        // Python: open(path, "w") -> create or truncate; write succeeds if root可写
+        // Python equivalent: open(path, "w") -> create or truncate; success means root is writable
         match fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -174,8 +281,9 @@ impl RoGuard {
         }
     }
 
-
-    /// ===== D1) 能力位读取：CapEff =====
+    /// Read effective capability bits from `/proc/self/status` (`CapEff` line).
+    ///
+    /// Returns the parsed `u64` value (0 if parsing fails).
     fn caps_eff(&self) -> u64 {
         let mut s = String::new();
         if let Ok(mut f) = fs::File::open("/proc/self/status") {
@@ -195,9 +303,13 @@ impl RoGuard {
         0
     }
 
-    /// ===== D2) remount 尝试：期望失败 =====
+    /// Attempt `mount -o remount,rw /` and return whether it was blocked.
+    ///
+    /// Returns `(blocked, message)`:
+    /// - `blocked = true` means the remount attempt failed (this is the *expected* secure state),
+    /// - `blocked = false` means it succeeded (insecure).
     fn try_remount_root_rw(&self) -> (bool, String) {
-        // true = blocked；false = 成功（不安全）
+        // true = blocked; false = success (unsafe)
         match Command::new("mount")
             .arg("-o").arg("remount,rw")
             .arg("/")
@@ -217,15 +329,34 @@ impl RoGuard {
         }
     }
 
-    /// ===== 公共方法：一次性校验 =====
+    /// Run a single verification round and return `(ok, Report)`.
+    ///
+    /// Logic:
+    /// - Parse and filter mount entries,
+    /// - Ensure required read-only mount points are `ro`,
+    /// - Ensure all `rw` mounts are in whitelist and use in-memory fs (`tmpfs/ramfs`),
+    /// - Probe write on `/` (expecting EROFS),
+    /// - Check capability bits (`CAP_SYS_ADMIN`, `CAP_MKNOD`),
+    /// - Ensure `remount,rw /` attempt is blocked.
+    ///
+    /// Returns:
+    /// - `ok = true` if all checks pass,
+    /// - `ok = false` otherwise, with details in `Report`.
+    ///
+    /// # Example
+    /// ```no_run
+    /// let (ok, report) = roguard::RoGuard::new().verify_once();
+    /// println!("{}", serde_json::to_string(&report).unwrap());
+    /// if !ok { std::process::exit(1); }
+    /// ```
     pub fn verify_once(&self) -> (bool, Report) {
-        // 读取挂载信息
+        // Read mount info
         let mounts = match self.parse_mountinfo() {
             Ok(v) => v,
             Err(_) => Vec::new(),
         };
 
-        // A) 必须只读的挂载
+        // A) Required read-only mounts
         let mut ro_viol: Vec<String> = Vec::new();
         for must_ro in &self.ro_required_ro {
             match self.get_mount(&mounts, must_ro) {
@@ -234,7 +365,7 @@ impl RoGuard {
             }
         }
 
-        // B) 发现所有 rw：只能在白名单里，且必须是 tmpfs/ramfs
+        // B) Detect all rw: must be in whitelist and tmpfs/ramfs
         let mut unexpected_rw: Vec<String> = Vec::new();
         let mut non_memfs_allowed: Vec<String> = Vec::new();
         for me in &mounts {
@@ -252,11 +383,11 @@ impl RoGuard {
             }
         }
 
-        // C) 根目录写入应 EROFS
+        // C) Root write should return EROFS
         let (ok_w, msg_w) = self.write_probe(PROBE_PATH);
         let root_write_ok = (!ok_w) && msg_w == "EROFS";
 
-        // D) 轻量加固：能力位 & remount
+        // D) Lightweight hardening: capability bits & remount attempt
         let caps = self.caps_eff();
         let mut cap_viol: Vec<String> = Vec::new();
         if (caps & CAP_SYS_ADMIN_BIT) != 0 {
@@ -267,13 +398,13 @@ impl RoGuard {
         }
         let (remount_blocked, remount_msg) = self.try_remount_root_rw();
 
-        // 总体是否 OK（与 Python 等价）
-        let ok = ro_viol.is_empty()  //只读的挂载点必须要是只读
-            && unexpected_rw.is_empty()     //没有意外的可写路径
-            && non_memfs_allowed.is_empty()   //可写路径里面没有在ro_mem_fs（即允许的挂载点）之外的
-            && root_write_ok                 //根路径不可写
-            && cap_viol.is_empty()          //容器内没有权限轻易的修改只读
-            && remount_blocked;             //尝试修改只读权限失败
+        // Overall check result (consistent with Python version)
+        let ok = ro_viol.is_empty()  // required mounts must be ro
+            && unexpected_rw.is_empty()     // no unexpected writable paths
+            && non_memfs_allowed.is_empty() // writable paths must be tmpfs/ramfs
+            && root_write_ok                // root must not be writable
+            && cap_viol.is_empty()          // no dangerous capabilities remain
+            && remount_blocked;             // remount must fail
 
         let mut allowed_rw_whitelist: Vec<String> =
             self.ro_allowed_rw.iter().cloned().collect();
@@ -284,41 +415,55 @@ impl RoGuard {
         required_ro.sort();
 
         let report = Report {
-            ro_violations: ro_viol,  // ro_required_ro 中规定必须是只读的挂载点，哪些没做到就会被记录在这里
-            unexpected_rw_mounts: unexpected_rw,  // 不在白名单里的挂载点，却以 rw 挂载，说明出现了额外的可写目录
-            allowed_but_not_memfs: non_memfs_allowed,  // 虽然目录在白名单里，但实际挂载的文件系统类型不是 tmpfs/ramfs
-            root_write_probe: RootWriteProbe { ok: root_write_ok, need: "EROFS" },  // 尝试在根目录 `/` 写入一个文件，如果报错且 errno=EROFS 才算符合预期
-            cap_violations: cap_viol,   // 检查进程的 CapEff（有效能力位），如果还残留了 CAP_SYS_ADMIN 或 CAP_MKNOD 之类的高危权限，就记录下来
-            remount_root_blocked: remount_blocked,   // 如果失败（EPERM），说明无法把根目录重新挂成可写 → true
-            remount_msg,   // 上一步 remount 命令返回的错误消息，方便调试（例如 "permission denied"）
-            allowed_rw_whitelist,   // 允许可写的挂载点白名单（配置中的集合），便于在报告里展示出来
-            required_ro,   // 要求必须只读的挂载点集合，便于在报告里展示出来
+            ro_violations: ro_viol,  // required ro mounts that failed
+            unexpected_rw_mounts: unexpected_rw,  // extra rw mounts not in whitelist
+            allowed_but_not_memfs: non_memfs_allowed,  // whitelisted but not tmpfs/ramfs
+            root_write_probe: RootWriteProbe { ok: root_write_ok, need: "EROFS" },  // root write probe
+            cap_violations: cap_viol,   // capability violations (e.g. CAP_SYS_ADMIN, CAP_MKNOD)
+            remount_root_blocked: remount_blocked,   // true if remount rw was blocked
+            remount_msg,   // error message from remount attempt
+            allowed_rw_whitelist,   // configured whitelist of writable mounts
+            required_ro,   // configured required read-only mounts
         };
 
         (ok, report)
     }
 
+    /// Watch mode: run `verify_once` repeatedly with a fixed period.
+    ///
+    /// Prints one line of JSON per loop iteration (suitable for JSONL logs). If the check fails
+    /// `grace` times consecutively, the process exits with code 1.
+    ///
+    /// This function never returns.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use std::time::Duration;
+    /// roguard::RoGuard::new().watch(Duration::from_secs(5), 1);
+    /// ```
     pub fn watch(&self, period: Duration, grace: u32) -> ! {
-        let mut consecutive_fail = 0u32;
+    let mut consecutive_fail = 0u32;
 
-        loop {
-            let (ok, report) = self.verify_once();
+    loop {
+        let (ok, report) = self.verify_once();
 
-            // 每轮都输出一行 JSON（便于收集到日志/JSONL）
-            // 你也可以改成只在失败时输出
-            println!("{}", serde_json::to_string(&report).unwrap());
-
-            if ok {
-                consecutive_fail = 0;
-            } else {
-                consecutive_fail += 1;
-                if consecutive_fail >= grace {
-                    eprintln!("[RO-GUARD] violation detected ({} consecutive)", consecutive_fail);
-                    std::process::exit(1);
-                }
-            }
-
-            thread::sleep(period);
+        // Only output report when violation occurs
+        if !ok {
+            eprintln!("{}", serde_json::to_string(&report).unwrap());
         }
+
+        if ok {
+            consecutive_fail = 0;
+        } else {
+            consecutive_fail += 1;
+            if consecutive_fail >= grace {
+                eprintln!("[RO-GUARD] violation detected ({} consecutive)", consecutive_fail);
+                std::process::exit(1);
+            }
+        }
+
+        thread::sleep(period);
     }
+}
+
 }
