@@ -156,11 +156,11 @@ impl RoGuard {
             "/tmp".to_string(),
             "/root/.triton".to_string(),
             "/root/.cache".to_string(),
+            "/model".to_string(),
         ]);
 
         let ro_required_ro = HashSet::from_iter([
             "/".to_string(),
-            "/model".to_string(),
         ]);
 
         let ro_mem_fs = HashSet::from_iter([
@@ -374,7 +374,7 @@ impl RoGuard {
             }
             if me.opts.contains("rw") {
                 if self.ro_allowed_rw.contains(me.mp.as_str()) {
-                    if !self.ro_mem_fs.contains(me.fstype.as_str()) {
+                    if me.mp != "/model" && !self.ro_mem_fs.contains(me.fstype.as_str()) {
                         non_memfs_allowed.push(format!("{} (fstype={})", me.mp, me.fstype));
                     }
                 } else {
